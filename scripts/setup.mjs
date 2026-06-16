@@ -27,6 +27,7 @@ const ENV_PATH = resolve(ROOT, ".env.local");
 const EXAMPLE_PATH = resolve(ROOT, ".env.local.example");
 const CRON_TPL = resolve(ROOT, "supabase/cron/schedule-buffer-flush.sql");
 const CRON_FILLED = resolve(ROOT, "supabase/cron/schedule-buffer-flush.filled.sql");
+const SUPABASE_API = "https://api.supabase.com"; // Management API base
 
 // Secrets we generate locally — never asked for, never rotated on re-run.
 const GENERATED = {
@@ -40,11 +41,11 @@ const PASTED = [
   "NEXT_PUBLIC_SUPABASE_URL",
   "NEXT_PUBLIC_SUPABASE_ANON_KEY",
   "SUPABASE_SERVICE_ROLE_KEY",
-  "YCLOUD_API_KEY",
-  "YCLOUD_WEBHOOK_SIGNING_SECRET",
   "OPENROUTER_API_KEY",
   "OPENROUTER_DEFAULT_MODEL",
 ];
+// NOTE: YCloud is NOT an env var — each workspace's API key + webhook signing
+// secret live in the app (Settings → Integraciones), encrypted per-tenant.
 
 // ── tiny ui helpers ─────────────────────────────────────────────────────────
 const log = (m) => console.log(m);
@@ -119,6 +120,50 @@ function deriveRef(url) {
   return m ? m[1] : null;
 }
 
+// ── Supabase Management API (optional automation — needs SUPABASE_ACCESS_TOKEN) ─
+const mgmtToken = () => process.env.SUPABASE_ACCESS_TOKEN || "";
+
+async function mgmtCall(method, path, body) {
+  const res = await fetch(`${SUPABASE_API}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${mgmtToken()}`,
+      "Content-Type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  return { status: res.status, ok: res.ok, data };
+}
+
+const remoteSql = (ref, query) =>
+  mgmtCall("POST", `/v1/projects/${ref}/database/query`, { query });
+
+// Shared cron inputs: prod URL + CRON_SECRET, validated (fails if not ready).
+function cronInputs() {
+  const env = readEnvFile(ENV_PATH);
+  const appUrl = (env.NEXT_PUBLIC_APP_URL || "").replace(/\/+$/, "");
+  const secret = env.CRON_SECRET;
+  if (isPlaceholder(appUrl) || /localhost/.test(appUrl)) {
+    fail("NEXT_PUBLIC_APP_URL no es una URL de prod. Corre set-app-url <url> después del deploy.");
+  }
+  if (isPlaceholder(secret)) fail("CRON_SECRET no generado. Corre 'env' primero.");
+  return { env, appUrl, secret };
+}
+
+function fillCronSql(appUrl, secret) {
+  if (!existsSync(CRON_TPL)) fail(`No encuentro la plantilla ${CRON_TPL}`);
+  return readFileSync(CRON_TPL, "utf8")
+    .replaceAll("__APP_URL__", appUrl)
+    .replaceAll("__CRON_SECRET__", secret);
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 function cmdEnv() {
   const current = readEnvFile(existsSync(ENV_PATH) ? ENV_PATH : EXAMPLE_PATH);
@@ -185,22 +230,53 @@ function cmdSetAppUrl(args) {
 }
 
 function cmdCronSql() {
-  if (!existsSync(CRON_TPL)) fail(`No encuentro la plantilla ${CRON_TPL}`);
-  const env = readEnvFile(ENV_PATH);
-  const appUrl = (env.NEXT_PUBLIC_APP_URL || "").replace(/\/+$/, "");
-  const secret = env.CRON_SECRET;
-  if (isPlaceholder(appUrl) || /localhost/.test(appUrl)) {
-    fail("NEXT_PUBLIC_APP_URL no es una URL de prod. Corre set-app-url <url> después del deploy.");
-  }
-  if (isPlaceholder(secret)) fail("CRON_SECRET no generado. Corre 'env' primero.");
-
-  const filled = readFileSync(CRON_TPL, "utf8")
-    .replaceAll("__APP_URL__", appUrl)
-    .replaceAll("__CRON_SECRET__", secret);
+  const { appUrl, secret } = cronInputs();
+  const filled = fillCronSql(appUrl, secret);
   writeFileSync(CRON_FILLED, filled);
   ok(`SQL del cron generado: ${CRON_FILLED}`);
   log("➡️  Pega el siguiente SQL en Supabase → SQL Editor → Run:\n");
   log(filled);
+}
+
+async function cmdCronApply() {
+  const { env, appUrl, secret } = cronInputs();
+  const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
+  if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
+  if (!mgmtToken()) {
+    warn("Sin SUPABASE_ACCESS_TOKEN — usa el camino manual:");
+    log("   node scripts/setup.mjs cron-sql   (y pega el SQL en el SQL Editor)");
+    return;
+  }
+  const r1 = await remoteSql(ref, fillCronSql(appUrl, secret));
+  if (!r1.ok) fail(`No pude agendar el cron ${r1.status}: ${JSON.stringify(r1.data)}`);
+  const r2 = await remoteSql(
+    ref,
+    "select jobname, schedule, active from cron.job where jobname = 'buffer-flush';",
+  );
+  ok("Cron buffer-flush agendado vía Management API.");
+  log(`Verificación: ${JSON.stringify(r2.data)}`);
+}
+
+async function cmdSiteUrl() {
+  const env = readEnvFile(ENV_PATH);
+  const appUrl = (env.NEXT_PUBLIC_APP_URL || "").replace(/\/+$/, "");
+  if (isPlaceholder(appUrl) || /localhost/.test(appUrl)) {
+    fail("NEXT_PUBLIC_APP_URL no es prod. Corre set-app-url <url> primero.");
+  }
+  const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
+  if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
+  if (!mgmtToken()) {
+    warn("Sin SUPABASE_ACCESS_TOKEN — hazlo manual en Supabase → Authentication → URL Configuration:");
+    log(`   Site URL     = ${appUrl}`);
+    log(`   Redirect URL = ${appUrl}/**`);
+    return;
+  }
+  const res = await mgmtCall("PATCH", `/v1/projects/${ref}/config/auth`, {
+    site_url: appUrl,
+    uri_allow_list: `${appUrl}/**`,
+  });
+  if (!res.ok) fail(`Management API (config/auth) falló ${res.status}: ${JSON.stringify(res.data)}`);
+  ok(`Site URL = ${appUrl} · Redirect = ${appUrl}/** (vía Management API)`);
 }
 
 function cmdVercelEnv() {
@@ -263,13 +339,18 @@ Uso: node scripts/setup.mjs <comando>
   env            Genera secrets + escribe .env.local desde las keys pegadas
   db-push [ref]  supabase link (ref derivado de la URL) + db push
   set-app-url U  Setea NEXT_PUBLIC_APP_URL a la URL de prod (post-deploy)
-  cron-sql       Llena el SQL del cron buffer-flush con valores reales
+  cron-sql       Imprime el SQL del cron para pegar en el SQL Editor (manual)
+  cron-apply     Agenda el cron vía Management API (necesita SUPABASE_ACCESS_TOKEN)
+  site-url       Setea Site URL + Redirect en Supabase vía Management API (idem)
   vercel-env     Empuja las vars de .env.local a Vercel production
   doctor         Revisa prerequisitos y qué keys faltan
   help           Muestra esta ayuda
 
 Las keys pegadas se pasan como variables de entorno, p.ej.:
-  NEXT_PUBLIC_SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node scripts/setup.mjs env`);
+  NEXT_PUBLIC_SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node scripts/setup.mjs env
+
+site-url / cron-apply usan un token de Management API (NO se guarda en .env.local):
+  SUPABASE_ACCESS_TOKEN=sbp_... node scripts/setup.mjs site-url`);
 }
 
 // ── dispatch ────────────────────────────────────────────────────────────────
@@ -286,6 +367,12 @@ switch (cmd) {
     break;
   case "cron-sql":
     cmdCronSql();
+    break;
+  case "cron-apply":
+    await cmdCronApply();
+    break;
+  case "site-url":
+    await cmdSiteUrl();
     break;
   case "vercel-env":
     cmdVercelEnv();

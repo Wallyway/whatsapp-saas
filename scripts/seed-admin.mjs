@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 // ============================================================================
-// scripts/seed-admin.mjs — create the super admin + demo workspace (Node-only)
+// scripts/seed-admin.mjs — create the SUPER ADMIN login (Node-only)
 //
-// Uses the Supabase service_role key (bypasses RLS) via REST: the Auth Admin API
-// to create the login user, and PostgREST to seed public.users / workspaces /
-// memberships. Every write is an idempotent upsert, so re-running is safe.
+// Creates ONLY the super admin: the auth user + the public.users row with
+// is_super_admin=true. The demo/client workspaces are created from the app UI
+// (panel de agencia → "crear workspace"), which builds a COMPLETE workspace
+// (global prompt + business_info + agents + integration). Seeding a workspace
+// by raw INSERT would leave it half-configured, so we don't.
+//
+// Uses the Supabase service_role key (bypasses RLS) via REST. Idempotent.
 //
 // Config (env vars; SUPABASE_* fall back to .env.local):
 //   NEXT_PUBLIC_SUPABASE_URL     Supabase project URL          (required)
@@ -12,8 +16,6 @@
 //   ADMIN_EMAIL                  super admin login email       (required)
 //   ADMIN_PASSWORD               super admin login password    (required, >= 8)
 //   ADMIN_NAME                   full name      (default: "Super Admin")
-//   WORKSPACE_NAME               demo workspace (default: "Clínica Demo")
-//   WORKSPACE_SLUG               demo slug      (default: "clinica-demo")
 //
 // Console output is Spanish (the member reads it); code is English.
 // ============================================================================
@@ -51,8 +53,6 @@ const SERVICE_KEY = cfg("SUPABASE_SERVICE_ROLE_KEY");
 const ADMIN_EMAIL = cfg("ADMIN_EMAIL");
 const ADMIN_PASSWORD = cfg("ADMIN_PASSWORD");
 const ADMIN_NAME = cfg("ADMIN_NAME", "Super Admin");
-const WORKSPACE_NAME = cfg("WORKSPACE_NAME", "Clínica Demo");
-const WORKSPACE_SLUG = cfg("WORKSPACE_SLUG", "clinica-demo");
 
 // ── validation ──────────────────────────────────────────────────────────────
 if (!SUPABASE_URL || /your-/.test(SUPABASE_URL)) fail("Falta NEXT_PUBLIC_SUPABASE_URL (corre setup.mjs env primero).");
@@ -119,41 +119,22 @@ async function upsertProfile(userId) {
   ok("Perfil public.users con is_super_admin = true");
 }
 
-async function upsertWorkspace() {
-  const res = await call("POST", `${SUPABASE_URL}/rest/v1/workspaces?on_conflict=slug`, {
-    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-    body: { name: WORKSPACE_NAME, slug: WORKSPACE_SLUG },
-  });
-  if (!res.ok) fail(`Error al upsert workspace. Status ${res.status}: ${JSON.stringify(res.data)}`);
-  const ws = Array.isArray(res.data) ? res.data[0] : res.data;
-  if (!ws?.id) fail(`El upsert de workspace no devolvió id: ${JSON.stringify(res.data)}`);
-  ok(`Workspace demo: "${WORKSPACE_NAME}" (${WORKSPACE_SLUG})`);
-  return ws.id;
-}
-
-async function upsertMembership(workspaceId, userId) {
-  const res = await call("POST", `${SUPABASE_URL}/rest/v1/memberships?on_conflict=workspace_id,user_id`, {
-    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-    body: { workspace_id: workspaceId, user_id: userId, role: "admin", is_active: true },
-  });
-  if (!res.ok) fail(`Error al upsert membership. Status ${res.status}: ${JSON.stringify(res.data)}`);
-  ok("Membership admin (super admin ↔ workspace demo)");
-}
-
 // ── main ────────────────────────────────────────────────────────────────────
 async function main() {
   log(`\nSembrando super admin en ${SUPABASE_URL} …\n`);
   const userId = await createOrFindAuthUser();
   await upsertProfile(userId);
-  const workspaceId = await upsertWorkspace();
-  await upsertMembership(workspaceId, userId);
 
   const appUrl = (cfg("NEXT_PUBLIC_APP_URL") || "").replace(/\/+$/, "");
+  const base = appUrl && !/your-|localhost/.test(appUrl) ? appUrl : "<tu-url-de-prod>";
   log("\n────────────────────────────────────────");
-  ok("Seed completo.");
-  log(`   Login:     ${appUrl && !/your-|localhost/.test(appUrl) ? appUrl : "<tu-url-de-prod>"}/login`);
-  log(`   Email:     ${ADMIN_EMAIL}`);
-  log(`   Workspace: ${WORKSPACE_NAME}`);
+  ok("Super admin listo.");
+  log(`   Login: ${base}/login`);
+  log(`   Email: ${ADMIN_EMAIL}`);
+  log("");
+  log("   ➡️  Entra y crea tu primer workspace de cliente desde el panel:");
+  log(`       ${base}/workspaces  →  \"Crear workspace\"`);
+  log("   (La app lo arma completo: prompt, agentes, business info e integración.)");
   log("────────────────────────────────────────\n");
 }
 

@@ -11,7 +11,9 @@ ALTER FUNCTION public.auth_has_role(uuid, public.workspace_role[]) SET search_pa
 REVOKE EXECUTE ON FUNCTION public.cancel_batch(uuid) FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION public.claim_next_batch() FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION public.check_outbound_24h_window() FROM anon;
-REVOKE EXECUTE ON FUNCTION public.handle_new_user() FROM anon;
+-- NOTE: there is no handle_new_user() function/trigger in this schema —
+-- public.users rows are created explicitly (seed + agency actions), not by a
+-- signup trigger. The previous REVOKE on it errored a clean db push; removed.
 
 -- Revoke anon from RLS helpers
 -- (authenticated users still invoke them implicitly via RLS policy evaluation)

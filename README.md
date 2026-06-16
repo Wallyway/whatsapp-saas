@@ -86,10 +86,10 @@ scripts/
 
 ## Variables de entorno
 
-Ver [`.env.local.example`](.env.local.example). Las de Supabase, YCloud y OpenRouter
-las pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
-`scripts/setup.mjs`. HighLevel se configura por workspace en Settings → Integraciones
-(no es env var).
+Ver [`.env.local.example`](.env.local.example). Las de Supabase y OpenRouter las
+pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
+`scripts/setup.mjs`. **YCloud y HighLevel NO son env vars** — se configuran por
+workspace en Settings → Integraciones (encriptados por tenant).
 
 ---
 

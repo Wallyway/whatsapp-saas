@@ -84,20 +84,19 @@ npm install
 > y **guarda la contraseña de la base de datos** (la vas a necesitar en el paso 5).
 > Cuando esté listo: **Settings → API**, y copia estos 3 valores.
 
-Pídele las 3 keys de Supabase (y, si ya las tiene, las de OpenRouter y YCloud) y
-córrelas inline. Esto **genera los 3 secrets** y escribe `.env.local`:
+Pídele las 3 keys de Supabase (y, si ya la tiene, la de OpenRouter) y córrelas
+inline. Esto **genera los 3 secrets** y escribe `.env.local`. (YCloud NO va aquí:
+se configura por workspace en la app, paso 10.)
 
 ```bash
 NEXT_PUBLIC_SUPABASE_URL='https://xxxx.supabase.co' \
 NEXT_PUBLIC_SUPABASE_ANON_KEY='eyJ...' \
 SUPABASE_SERVICE_ROLE_KEY='eyJ...' \
 OPENROUTER_API_KEY='sk-or-...' \
-YCLOUD_API_KEY='...' \
-YCLOUD_WEBHOOK_SIGNING_SECRET='...' \
 node scripts/setup.mjs env
 ```
 
-Si todavía no tiene las de YCloud/OpenRouter, corre `env` con lo que haya y vuelve a
+Si todavía no tiene la de OpenRouter, corre `env` con lo que haya y vuelve a
 correrlo después (es idempotente: **no rota** los secrets ya generados).
 
 **5. Aplica las migraciones.** Primero el login (abre el browser, que el usuario
@@ -123,42 +122,51 @@ node scripts/setup.mjs vercel-env        # ahora sí sube NEXT_PUBLIC_APP_URL
 vercel --prod                            # redeploy con la URL final
 ```
 
-**7. Site URL en Supabase.** Guía al usuario:
+**7. Site URL en Supabase (automático).** Pídele al usuario un **Management API
+token** (https://supabase.com/dashboard/account/tokens → _Generate new token_) y
+expórtalo una vez — sirve para los pasos 7 y 9:
 
-> En el dashboard de Supabase → **Authentication → URL Configuration**:
-> pon **Site URL** = tu URL de Vercel, y en **Redirect URLs** agrega
-> `https://TU-URL.vercel.app/**`. Guarda.
+```bash
+export SUPABASE_ACCESS_TOKEN='sbp_...'
+node scripts/setup.mjs site-url
+```
 
+Esto setea **Site URL** + **Redirect URLs** a tu dominio de Vercel. Si el usuario
+prefiere no usar token, hazlo manual: Supabase → **Authentication → URL
+Configuration** → Site URL = tu URL, Redirect = `<url>/**`.
 (Sin esto, el login y el reset de contraseña redirigen mal.)
 
-**8. Crea tu super admin + workspace demo.** Pídele al usuario un email y una
-contraseña (mínimo 8 caracteres) para entrar a la plataforma:
+**8. Crea tu super admin.** Pídele un email y una contraseña (mínimo 8 caracteres)
+para entrar a la plataforma:
 
 ```bash
 ADMIN_EMAIL='tu@correo.com' ADMIN_PASSWORD='una-clave-segura' \
 node scripts/seed-admin.mjs
 ```
 
-**9. Agenda el cron del buffer (pg_cron).** Genera el SQL ya con tus valores:
+(Crea SOLO el super admin. Los workspaces de clientes se crean desde la app, paso 10.)
+
+**9. Agenda el cron del buffer (automático).**
 
 ```bash
-node scripts/setup.mjs cron-sql
+node scripts/setup.mjs cron-apply
 ```
 
-Toma el SQL que imprime y guía al usuario a pegarlo en
-**Supabase → SQL Editor → Run**. Verifica que quedó registrado:
+Usa el `SUPABASE_ACCESS_TOKEN` del paso 7 para agendar el cron vía Management API e
+imprime la verificación. Si no hay token, cae al camino manual: corre
+`node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
 
-```sql
-select jobname, schedule, active from cron.job where jobname = 'buffer-flush';
-```
+**10. Entra y crea tu primer workspace.** Abre `https://TU-URL.vercel.app/login`,
+entra con tu super admin, y en el **panel de agencia** (`/workspaces`) dale **crear
+workspace**. La app lo arma completo (prompt, agentes, business info e integración).
+Este es el flujo real que repetirás por cada cliente.
 
-**10. Conecta el webhook de YCloud.** Abre tu URL de producción, entra con tu super
-admin, abre el workspace demo y ve a **Settings → Integraciones**. Ahí la app te
-muestra el **Webhook URL** (ya trae el `wsid` correcto) con un botón de copiar.
-Pégalo en la consola de **YCloud → Webhooks** y conecta tu número de WhatsApp.
-(El signing secret ya quedó en las env vars.)
+**11. Conecta YCloud en ESE workspace.** Dentro del workspace, ve a
+**Settings → Integraciones**: pega la **API Key** y el **Webhook Signing Secret** de
+YCloud (cada cliente tiene los suyos), y copia el **Webhook URL** que muestra la app
+(ya trae el `wsid` correcto) → pégalo en **YCloud → Webhooks** y conecta el número.
 
-**11. Verificación final.** Desde un teléfono, manda un WhatsApp al número de YCloud.
+**12. Verificación final.** Desde un teléfono, manda un WhatsApp al número de YCloud.
 En ~1 minuto (cuando dispare el cron) el agente debe responder. Si no, revisa las
 corridas del cron:
 
@@ -169,8 +177,8 @@ where jobid = (select jobid from cron.job where jobname = 'buffer-flush')
 order by start_time desc limit 5;
 ```
 
-**12. Listo → onboarding del primer cliente.** Manda al usuario a
-`https://TU-URL.vercel.app/onboarding` para crear el primer workspace de cliente real.
+**13. Más clientes.** Repite los pasos 10–11 por cada cliente nuevo: un workspace +
+su propia integración de YCloud.
 
 ---
 
