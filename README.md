@@ -74,4 +74,4 @@ las pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **g
 
 ---
 
-_Material para miembros de Imperio Digital._
+_Material para miembros de Imperio Agentico._
