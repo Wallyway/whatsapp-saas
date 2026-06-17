@@ -64,28 +64,63 @@ export async function transcribeAudio(opts: {
   const apiKey = await getOpenRouterApiKey(opts.workspaceId);
   if (!apiKey) return null;
 
+  // Call OpenRouter directly with the OpenAI-style `input_audio` content part.
+  // The AI SDK's `type:"file"` audio part is NOT serialized to `input_audio`,
+  // so the model never received the audio and returned empty → the agent saw
+  // "[nota de voz no transcrita]". WhatsApp voice notes are ogg/opus.
+  const mime = opts.mimeType || "audio/ogg";
+  const format =
+    mime.includes("mp3") || mime.includes("mpeg")
+      ? "mp3"
+      : mime.includes("wav")
+        ? "wav"
+        : mime.includes("m4a") || mime.includes("mp4")
+          ? "m4a"
+          : "ogg";
+  const b64 = Buffer.from(bytes).toString("base64");
+
   try {
-    const { text } = await generateText({
-      model: openrouter(apiKey).chat(UNDERSTANDING_MODEL),
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "Transcribe esta nota de voz de WhatsApp palabra por palabra, en su idioma original. Devuelve SOLO la transcripción, sin comentarios ni comillas.",
-            },
-            {
-              type: "file",
-              data: bytes,
-              mediaType: opts.mimeType || "audio/ogg",
-            },
-          ],
-        },
-      ],
-      maxOutputTokens: 1024,
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer":
+          process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
+        "X-Title": "Agente WhatsApp",
+      },
+      body: JSON.stringify({
+        model: UNDERSTANDING_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Transcribe esta nota de voz de WhatsApp palabra por palabra, en su idioma original. Devuelve SOLO la transcripción, sin comentarios ni comillas.",
+              },
+              { type: "input_audio", input_audio: { data: b64, format } },
+            ],
+          },
+        ],
+        max_tokens: 1024,
+      }),
     });
-    return text.trim() || null;
+
+    if (!res.ok) {
+      console.error(
+        "[media-understanding] transcribeAudio HTTP",
+        res.status,
+        (await res.text()).slice(0, 200),
+      );
+      return null;
+    }
+
+    const data = (await res.json()) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const text = data?.choices?.[0]?.message?.content;
+    return typeof text === "string" && text.trim() ? text.trim() : null;
   } catch (err) {
     console.error(
       "[media-understanding] transcribeAudio error:",
