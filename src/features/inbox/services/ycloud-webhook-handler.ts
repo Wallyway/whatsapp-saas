@@ -84,6 +84,32 @@ export interface NormalizedInbound {
 /** Inbound message types that carry a downloadable media payload. */
 const MEDIA_TYPES = ["image", "audio", "voice", "video", "document", "sticker"];
 
+/** Valid public.message_type enum values — the DB rejects anything else. */
+const MESSAGE_TYPE_ENUM = new Set([
+  "text",
+  "audio",
+  "image",
+  "document",
+  "video",
+  "sticker",
+  "location",
+  "template",
+  "system",
+]);
+
+/**
+ * Clamp YCloud's raw message type to a valid message_type enum value so the
+ * INSERT never fails — an out-of-enum value (e.g. WhatsApp voice notes arriving
+ * as 'voice', or the 'unknown' fallback) would otherwise raise 22P02 and the
+ * inbound message would be silently dropped. Voice notes → 'audio'
+ * (consolidateBatch handles both); anything unrecognized → 'text'. The RAW type
+ * is still used above for media extraction (wimObj[msgType]).
+ */
+function toMessageType(raw: string): string {
+  if (raw === "voice") return "audio";
+  return MESSAGE_TYPE_ENUM.has(raw) ? raw : "text";
+}
+
 /**
  * Parses and normalises a raw YCloud webhook body.
  * Returns null if the event is not an inbound message or is malformed.
@@ -171,7 +197,7 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
     return {
       workspacePhone: to,
       from,
-      type: msgType,
+      type: toMessageType(msgType),
       text,
       wamid,
       customerName,
