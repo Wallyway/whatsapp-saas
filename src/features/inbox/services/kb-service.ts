@@ -71,7 +71,10 @@ export async function ingestDocument(opts: {
   meta?: Record<string, unknown>;
 }): Promise<IngestDocumentResult> {
   const supabase = svc();
-  const { workspaceId, title, content, sourceType = "manual", meta } = opts;
+  // Default must satisfy the kb_documents CHECK (source_type IN
+  // 'doc','faq','url','snippet'); the old 'manual' default raised a 23514 on any
+  // caller that omitted sourceType.
+  const { workspaceId, title, content, sourceType = "doc", meta } = opts;
 
   // 1. Insert document record
   const { data: doc, error: docError } = await supabase
