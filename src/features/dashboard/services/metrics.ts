@@ -2,6 +2,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import type { ConversationState } from "@/features/inbox/types";
+import { estimateCostUsd } from "@/features/agents/lib/model-pricing";
 
 function svc() {
   return createSbClient(
@@ -26,9 +27,6 @@ export interface RecentConversation {
   state: ConversationState;
   lastMessageAt: string | null;
 }
-
-// Rough $/token estimate for cost display (blended model avg)
-const USD_PER_TOKEN = 0.000_002;
 
 export async function getWorkspaceMetrics(
   workspaceId: string,
@@ -87,17 +85,26 @@ export async function getWorkspaceMetrics(
       .gte("created_at", weekStart.toISOString()),
   ]);
 
-  const totalTokensWeek = (llmEventsResult.data ?? []).reduce((sum, row) => {
+  // Weight each call by its actual model and input/output split. A single flat
+  // $/token rate underestimated premium-model spend 5-20x.
+  const num = (v: unknown) => (typeof v === "number" ? v : 0);
+  const llmCostWeekUsd = (llmEventsResult.data ?? []).reduce((sum, row) => {
     const payload = row.payload as Record<string, unknown> | null;
-    const t = payload?.total_tokens;
-    return sum + (typeof t === "number" ? t : 0);
+    const model =
+      typeof payload?.model === "string" ? (payload.model as string) : null;
+    // Fall back to total_tokens as input when the split is missing (older rows).
+    const prompt = num(payload?.prompt_tokens);
+    const completion = num(payload?.completion_tokens);
+    const fallbackInput =
+      prompt === 0 && completion === 0 ? num(payload?.total_tokens) : prompt;
+    return sum + estimateCostUsd(model, fallbackInput, completion);
   }, 0);
 
   return {
     messagesToday: messagesResult.count ?? 0,
     activeConversations: activeResult.count ?? 0,
     handoffPending: handoffResult.count ?? 0,
-    llmCostWeekUsd: totalTokensWeek * USD_PER_TOKEN,
+    llmCostWeekUsd,
     templatesSentWeek: templatesResult.count ?? 0,
   };
 }
