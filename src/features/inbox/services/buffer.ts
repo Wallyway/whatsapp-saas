@@ -528,6 +528,27 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       throw new Error(`YCloud integration not found: ${intError?.message}`);
     }
 
+    // ── 9b. Re-check the AI switch right before dispatch (#6 race) ───────────
+    // decide() ran before the (multi-second) LLM call; a human may have toggled
+    // the AI off or taken over the thread in the meantime. Re-read the live
+    // state/ai_enabled and abstain rather than send an unwanted reply.
+    const { data: freshConv } = await supabase
+      .from("conversations")
+      .select("ai_enabled, state")
+      .eq("id", batch.conversation_id)
+      .single();
+    if (
+      freshConv &&
+      (freshConv.ai_enabled === false || freshConv.state !== "ai_active")
+    ) {
+      console.info(
+        "[buffer] AI turned off during generation — abstaining:",
+        freshConv.state,
+      );
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
     // ── 10a. Persist the generated reply BEFORE sending (idempotency for #5) ─
     // If the function is killed between the send and markBatchProcessed, the
     // re-claim guard above uses dispatch_started_at to avoid a double reply and
