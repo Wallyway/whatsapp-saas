@@ -79,9 +79,13 @@ function svc() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // upsertBatch
-// Creates a new buffering batch for a conversation, or extends an existing one.
-// On extend: push flush_at forward by silence_ms, increment message_count, link msg.
-// On create: insert batch, then link message.
+// Extends the live buffering batch for a conversation, or creates one, and links
+// the inbound message — all atomically inside the upsert_buffering_batch RPC.
+//
+// The atomicity (partial unique index + row lock + retry-on-23505 in the RPC) is
+// what prevents (a) two concurrent webhooks creating two batches -> a double AI
+// reply, and (b) a message being linked to an already-claimed batch and then
+// never answered. Do NOT reintroduce a check-then-insert here.
 // Returns the batch ID.
 // ──────────────────────────────────────────────────────────────────────────────
 export async function upsertBatch(opts: {
@@ -98,75 +102,21 @@ export async function upsertBatch(opts: {
   } = opts;
   const supabase = svc();
 
-  // 1. Look for an active buffering batch for this conversation
-  const { data: existing } = await supabase
-    .from("message_batches")
-    .select("id, message_count, flush_at")
-    .eq("workspace_id", workspaceId)
-    .eq("conversation_id", conversationId)
-    .eq("status", "buffering")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc("upsert_buffering_batch", {
+    p_workspace_id: workspaceId,
+    p_conversation_id: conversationId,
+    p_message_id: messageId,
+    p_silence_ms: silenceMs,
+  });
 
-  let batchId: string;
-
-  if (existing) {
-    // Extend: push flush_at forward and increment count
-    const newFlushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { error: updateError } = await supabase
-      .from("message_batches")
-      .update({
-        flush_at: newFlushAt,
-        message_count: existing.message_count + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", existing.id)
-      .eq("status", "buffering"); // Guard: only extend if still buffering
-
-    if (updateError) {
-      console.error("[buffer] extend batch error:", updateError);
-      throw new Error(`Failed to extend batch: ${updateError.message}`);
-    }
-
-    batchId = existing.id as string;
-  } else {
-    // Create a new buffering batch
-    const flushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { data: created, error: insertError } = await supabase
-      .from("message_batches")
-      .insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        status: "buffering",
-        silence_ms: silenceMs,
-        flush_at: flushAt,
-        message_count: 1,
-        meta: {},
-      })
-      .select("id")
-      .single();
-
-    if (insertError || !created) {
-      console.error("[buffer] create batch error:", insertError);
-      throw new Error(`Failed to create batch: ${insertError?.message}`);
-    }
-
-    batchId = created.id as string;
+  if (error || !data) {
+    console.error("[buffer] upsert_buffering_batch error:", error);
+    throw new Error(
+      `Failed to upsert batch: ${error?.message ?? "no batch id returned"}`,
+    );
   }
 
-  // 2. Link the message to the batch
-  const { error: linkError } = await supabase
-    .from("messages")
-    .update({ batch_id: batchId })
-    .eq("id", messageId);
-
-  if (linkError) {
-    // Non-fatal: batch still works; log and continue
-    console.warn("[buffer] failed to link message to batch:", linkError);
-  }
-
-  return batchId;
+  return data as string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
