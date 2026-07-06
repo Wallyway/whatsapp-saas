@@ -8,6 +8,11 @@ import type { AgentConfig } from "@/features/agents/types";
 
 const CHEAP_MODEL = "openai/gpt-4o-mini";
 
+// Debounce: auto-tag/summarize is best-effort context, not needed every turn.
+// Run on the first agent reply, then every Nth, using the outbound message count
+// as a monotonic turn counter. Cuts the extra cheap-model call ~Nx.
+const AUTO_PROCESS_EVERY = 3;
+
 function svc() {
   return svcClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -41,6 +46,16 @@ export async function maybeAutoProcess(opts: {
 
   try {
     const db = svc();
+
+    // Debounce on the monotonic agent-reply count (the reply that triggered this
+    // was already persisted). Run on the 1st reply, then every AUTO_PROCESS_EVERY.
+    const { count: outCount } = await db
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("conversation_id", conversationId)
+      .eq("direction", "out");
+    const turn = outCount ?? 0;
+    if (turn !== 1 && turn % AUTO_PROCESS_EVERY !== 0) return;
 
     const { data: msgs } = await db
       .from("messages")
