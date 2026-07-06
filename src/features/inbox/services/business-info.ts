@@ -60,13 +60,18 @@ function offsetFor(timeZone: string, now: Date): string {
  */
 export function buildNowContext(timeZone = "America/Mexico_City"): string {
   const now = new Date();
-  const human = now.toLocaleString("es-MX", {
+  // Date + hour only (no minutes). Minute-precision here changed the system
+  // prompt every single minute and defeated prompt caching; the agent only
+  // needs the current date and approximate hour to interpret "hoy"/"esta
+  // tarde" — exact times come from the user's request and the availability tool.
+  const dateStr = now.toLocaleDateString("es-MX", { timeZone, dateStyle: "full" });
+  const hour = new Intl.DateTimeFormat("es-MX", {
     timeZone,
-    dateStyle: "full",
-    timeStyle: "short",
-  });
+    hour: "2-digit",
+    hour12: false,
+  }).format(now);
   const offset = offsetFor(timeZone, now);
-  return `## Fecha actual\nHoy es ${human} (zona horaria ${timeZone}, offset ${offset}). Usa esta fecha para interpretar "hoy", "mañana", "esta semana", etc. al consultar disponibilidad o agendar. Cuando agendes, construye las horas en ISO con el offset ${offset} (ej: 2026-06-12T10:00:00${offset}), y pasa la zona horaria ${timeZone} a la herramienta de disponibilidad.`;
+  return `## Fecha actual\nHoy es ${dateStr}, alrededor de las ${hour}:00 (zona horaria ${timeZone}, offset ${offset}). Usa esta fecha para interpretar "hoy", "mañana", "esta semana", etc. al consultar disponibilidad o agendar. Cuando agendes, construye las horas en ISO con el offset ${offset} (ej: 2026-06-12T10:00:00${offset}), y pasa la zona horaria ${timeZone} a la herramienta de disponibilidad.`;
 }
 
 /**
