@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient } from "@/lib/supabase/server";
 import { getSignedUrl } from "@/features/inbox/services/media-handler";
+import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const requestSchema = z.object({
   storagePath: z.string().min(1),
@@ -11,9 +14,12 @@ const requestSchema = z.object({
  * POST /api/inbox/media-url
  *
  * Generates a 1-hour signed URL for a file in the whatsapp-media bucket.
- * Requires the caller to be authenticated; the workspace check is implicit
- * because storage_path encodes the workspace_id as its first segment, and
- * the Supabase RLS policy on storage.objects validates workspace membership.
+ *
+ * getSignedUrl signs with the service role, which BYPASSES storage RLS — so the
+ * old "authenticated is enough" check was an IDOR: any logged-in user could sign
+ * any workspace's media by guessing/leaking a storage path. The path is
+ * {workspaceId}/{conversationId}/..., so we require the caller to be a member of
+ * that first-segment workspace before signing.
  *
  * Body: { storagePath: string }
  * Response: { url: string }
@@ -30,14 +36,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Verify authentication
-    const supabase = await createClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) {
-      return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+    // 2. Derive the owning workspace from the path and verify membership.
+    const workspaceId = parsed.data.storagePath.split("/")[0];
+    if (!workspaceId || !UUID_RE.test(workspaceId)) {
+      return NextResponse.json(
+        { error: "storagePath inválido" },
+        { status: 400 },
+      );
     }
+    const auth = await requireWorkspaceMember(workspaceId);
+    if (!auth.ok) return auth.response;
 
     // 3. Generate signed URL (service role, 1 hour TTL)
     const url = await getSignedUrl(parsed.data.storagePath);

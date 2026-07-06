@@ -37,12 +37,18 @@ type MessageStatus = OrderedStatus | "failed";
 
 async function handleStatusUpdate(
   supabase: ReturnType<typeof svc>,
+  workspaceId: string,
   wamid: string,
   newStatus: string,
 ): Promise<void> {
+  // Scope by workspace_id: wamid is not globally unique across tenants, and a
+  // status webhook is only authorized (via its verified signing secret) for the
+  // workspace in ?wsid. Without this filter, two workspaces sharing a YCloud
+  // account could clobber each other's message status by wamid collision.
   const { data: msg } = await supabase
     .from("messages")
     .select("id, status")
+    .eq("workspace_id", workspaceId)
     .eq("wamid", wamid)
     .single();
 
@@ -178,9 +184,26 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         body as { whatsappMessage?: { wamid?: string; status?: string } }
       ).whatsappMessage;
       if (statusData?.wamid && statusData?.status) {
-        await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
+        await handleStatusUpdate(
+          supabase,
+          ws.workspace_id as string,
+          statusData.wamid,
+          statusData.status,
+        );
       }
       return NextResponse.json({ received: true });
+    }
+
+    // When routed by ?wsid, make sure the inbound message's destination number
+    // actually belongs to that workspace. Two tenants sharing one YCloud account
+    // share a signing secret, so the signature alone can't tell them apart; this
+    // stops one tenant from ingesting (and replying to) the other's customer.
+    if (wsidParam && toPhone) {
+      const wsPhone = (ws.config as { phone_number?: string }).phone_number;
+      const digits = (s: string) => s.replace(/\D/g, "");
+      if (wsPhone && digits(wsPhone) !== digits(toPhone)) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      }
     }
 
     const normalized = parseInbound(body);

@@ -79,9 +79,13 @@ function svc() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // upsertBatch
-// Creates a new buffering batch for a conversation, or extends an existing one.
-// On extend: push flush_at forward by silence_ms, increment message_count, link msg.
-// On create: insert batch, then link message.
+// Extends the live buffering batch for a conversation, or creates one, and links
+// the inbound message — all atomically inside the upsert_buffering_batch RPC.
+//
+// The atomicity (partial unique index + row lock + retry-on-23505 in the RPC) is
+// what prevents (a) two concurrent webhooks creating two batches -> a double AI
+// reply, and (b) a message being linked to an already-claimed batch and then
+// never answered. Do NOT reintroduce a check-then-insert here.
 // Returns the batch ID.
 // ──────────────────────────────────────────────────────────────────────────────
 export async function upsertBatch(opts: {
@@ -98,75 +102,21 @@ export async function upsertBatch(opts: {
   } = opts;
   const supabase = svc();
 
-  // 1. Look for an active buffering batch for this conversation
-  const { data: existing } = await supabase
-    .from("message_batches")
-    .select("id, message_count, flush_at")
-    .eq("workspace_id", workspaceId)
-    .eq("conversation_id", conversationId)
-    .eq("status", "buffering")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc("upsert_buffering_batch", {
+    p_workspace_id: workspaceId,
+    p_conversation_id: conversationId,
+    p_message_id: messageId,
+    p_silence_ms: silenceMs,
+  });
 
-  let batchId: string;
-
-  if (existing) {
-    // Extend: push flush_at forward and increment count
-    const newFlushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { error: updateError } = await supabase
-      .from("message_batches")
-      .update({
-        flush_at: newFlushAt,
-        message_count: existing.message_count + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", existing.id)
-      .eq("status", "buffering"); // Guard: only extend if still buffering
-
-    if (updateError) {
-      console.error("[buffer] extend batch error:", updateError);
-      throw new Error(`Failed to extend batch: ${updateError.message}`);
-    }
-
-    batchId = existing.id as string;
-  } else {
-    // Create a new buffering batch
-    const flushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { data: created, error: insertError } = await supabase
-      .from("message_batches")
-      .insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        status: "buffering",
-        silence_ms: silenceMs,
-        flush_at: flushAt,
-        message_count: 1,
-        meta: {},
-      })
-      .select("id")
-      .single();
-
-    if (insertError || !created) {
-      console.error("[buffer] create batch error:", insertError);
-      throw new Error(`Failed to create batch: ${insertError?.message}`);
-    }
-
-    batchId = created.id as string;
+  if (error || !data) {
+    console.error("[buffer] upsert_buffering_batch error:", error);
+    throw new Error(
+      `Failed to upsert batch: ${error?.message ?? "no batch id returned"}`,
+    );
   }
 
-  // 2. Link the message to the batch
-  const { error: linkError } = await supabase
-    .from("messages")
-    .update({ batch_id: batchId })
-    .eq("id", messageId);
-
-  if (linkError) {
-    // Non-fatal: batch still works; log and continue
-    console.warn("[buffer] failed to link message to batch:", linkError);
-  }
-
-  return batchId;
+  return data as string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -232,6 +182,99 @@ async function consolidateBatch(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Dispatch failure classification + idempotency helpers
+//
+// Terminal errors mean "retrying will never succeed" (the 24h window closed, or
+// the contact opted out) — we log an alert and stop instead of burning retries.
+// Everything else (network blips, YCloud 5xx/429) is transient → we throw so the
+// batch retry loop picks it up and RESENDS the already-generated reply, never
+// re-paying the LLM.
+// ──────────────────────────────────────────────────────────────────────────────
+const TERMINAL_DISPATCH_ERRORS = ["WINDOW_EXPIRED", "OPT_OUT"];
+
+function isTerminalDispatchError(error?: string): boolean {
+  if (!error) return false;
+  return TERMINAL_DISPATCH_ERRORS.some((e) => error.startsWith(e));
+}
+
+// True if an outbound (non-failed) message already exists since `sinceIso`.
+// Used to detect a reply that was sent right before the function was killed, so
+// a re-claim never double-sends.
+async function outboundSentSince(
+  conversationId: string,
+  sinceIso: string,
+  supabase: ReturnType<typeof svc>,
+): Promise<boolean> {
+  const { data } = await supabase
+    .from("messages")
+    .select("id")
+    .eq("conversation_id", conversationId)
+    .eq("direction", "out")
+    .neq("status", "failed")
+    .gte("created_at", sinceIso)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+// True if a NEWER inbound message joined this batch after `sinceIso` — in which
+// case a persisted pending_reply is stale and we must regenerate.
+async function inboundSince(
+  batchId: string,
+  sinceIso: string,
+  supabase: ReturnType<typeof svc>,
+): Promise<boolean> {
+  const { data } = await supabase
+    .from("messages")
+    .select("id")
+    .eq("batch_id", batchId)
+    .eq("direction", "in")
+    .gt("created_at", sinceIso)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+type DispatchOutcome = { status: "sent" } | { status: "terminal" };
+
+// Sends the reply and classifies the result. Marks the batch processed on a
+// terminal failure (after logging an alert). THROWS on a transient failure so
+// the caller's retry loop resends. Never swallows a failure silently.
+async function dispatchReply(opts: {
+  batchId: string;
+  workspaceId: string;
+  conversationId: string;
+  replyText: string;
+  mergedText: string;
+  supabase: ReturnType<typeof svc>;
+}): Promise<DispatchOutcome> {
+  const result = await dispatchText({
+    workspaceId: opts.workspaceId,
+    conversationId: opts.conversationId,
+    body: opts.replyText,
+    // AI-generated: no senderUserId
+  });
+
+  if (result.ok) return { status: "sent" };
+
+  if (isTerminalDispatchError(result.error)) {
+    console.warn("[buffer] dispatch terminal failure:", result.error);
+    await opts.supabase.from("events").insert({
+      type: "dispatch_failed_terminal",
+      level: "error",
+      workspace_id: opts.workspaceId,
+      conversation_id: opts.conversationId,
+      payload: { batch_id: opts.batchId, error: result.error },
+    });
+    await markBatchProcessed(opts.batchId, opts.mergedText, opts.supabase);
+    return { status: "terminal" };
+  }
+
+  // Transient: bubble up so the batch reverts to buffering and retries. The
+  // pending_reply persisted before the send lets the retry resend without
+  // re-invoking the LLM.
+  throw new Error(`dispatch failed (transient): ${result.error}`);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // processNextBatch (exported)
 // Called by the cron job (/api/cron/buffer-flush) or the internal trigger.
 //
@@ -281,6 +324,51 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     if (convError || !conversation) {
       throw new Error(`Conversation not found: ${convError?.message}`);
+    }
+
+    // ── 4b. Kill-recovery guard (idempotency for #5) ─────────────────────────
+    // If this batch already attempted a dispatch on a prior claim (the function
+    // was killed between sending and marking it processed), do NOT regenerate or
+    // resend blindly:
+    //   • if an outbound reply already went out → it was delivered; just finish.
+    //   • else if we have the generated reply and no newer inbound arrived →
+    //     resend that exact reply (no second LLM call).
+    //   • else → fall through and regenerate normally.
+    const priorDispatchAt =
+      typeof batch.meta?.dispatch_started_at === "string"
+        ? (batch.meta.dispatch_started_at as string)
+        : null;
+    if (priorDispatchAt) {
+      if (
+        await outboundSentSince(batch.conversation_id, priorDispatchAt, supabase)
+      ) {
+        await markBatchProcessed(
+          batch.id,
+          batch.merged_text ?? mergedText,
+          supabase,
+        );
+        return { processed: true, conversationId: batch.conversation_id };
+      }
+      const pendingReply =
+        typeof batch.meta?.pending_reply === "string"
+          ? (batch.meta.pending_reply as string)
+          : null;
+      if (
+        pendingReply &&
+        !(await inboundSince(batch.id, priorDispatchAt, supabase))
+      ) {
+        await dispatchReply({
+          batchId: batch.id,
+          workspaceId: batch.workspace_id,
+          conversationId: batch.conversation_id,
+          replyText: pendingReply,
+          mergedText,
+          supabase,
+        });
+        // On a pure resend we skip post-actions to avoid duplicating them.
+        await markBatchProcessed(batch.id, mergedText, supabase);
+        return { processed: true, conversationId: batch.conversation_id };
+      }
     }
 
     // ── 5. Decision engine: state check + handoff trigger + rate limits ──────
@@ -440,20 +528,65 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       throw new Error(`YCloud integration not found: ${intError?.message}`);
     }
 
-    // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
-    const dispatchResult = await dispatchText({
-      workspaceId: batch.workspace_id,
-      conversationId: batch.conversation_id,
-      body: reply.text,
-      // AI-generated: no senderUserId
-    });
-
-    if (!dispatchResult.ok) {
-      console.error("[buffer] dispatchText failed:", dispatchResult.error);
+    // ── 9b. Re-check the AI switch right before dispatch (#6 race) ───────────
+    // decide() ran before the (multi-second) LLM call; a human may have toggled
+    // the AI off or taken over the thread in the meantime. Re-read the live
+    // state/ai_enabled and abstain rather than send an unwanted reply.
+    const { data: freshConv } = await supabase
+      .from("conversations")
+      .select("ai_enabled, state")
+      .eq("id", batch.conversation_id)
+      .single();
+    if (
+      freshConv &&
+      (freshConv.ai_enabled === false || freshConv.state !== "ai_active")
+    ) {
+      console.info(
+        "[buffer] AI turned off during generation — abstaining:",
+        freshConv.state,
+      );
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
     }
 
-    // ── 10b. Mark batch as processed ────────────────────────────────────────
+    // ── 10a. Persist the generated reply BEFORE sending (idempotency for #5) ─
+    // If the function is killed between the send and markBatchProcessed, the
+    // re-claim guard above uses dispatch_started_at to avoid a double reply and
+    // pending_reply to resend without re-invoking the LLM. We mutate batch.meta
+    // in memory too, so the retry path in the catch block preserves both fields.
+    const dispatchStartedAt = new Date().toISOString();
+    const persistedMeta = {
+      ...batch.meta,
+      pending_reply: reply.text,
+      dispatch_started_at: dispatchStartedAt,
+    };
+    await supabase
+      .from("message_batches")
+      .update({ meta: persistedMeta, updated_at: new Date().toISOString() })
+      .eq("id", batch.id);
+    batch.meta = persistedMeta;
+
+    // ── 10b. Dispatch via single exit point (SEC-04) ─────────────────────────
+    // Terminal failures are logged + marked processed inside dispatchReply;
+    // transient failures throw into the retry loop below (which resends the
+    // persisted reply). No failure is swallowed silently.
+    const outcome = await dispatchReply({
+      batchId: batch.id,
+      workspaceId: batch.workspace_id,
+      conversationId: batch.conversation_id,
+      replyText: reply.text,
+      mergedText,
+      supabase,
+    });
+
+    // ── 10c. Mark batch as processed ────────────────────────────────────────
     await markBatchProcessed(batch.id, mergedText, supabase);
+
+    // A terminal dispatch failure (window expired / opt-out) already alerted;
+    // skip the post-actions that assume the customer got a reply.
+    if (outcome.status === "terminal") {
+      return { processed: true, conversationId: batch.conversation_id };
+    }
 
     // ── 10c. v1.5 opt-in: AI auto-tagging + summary (fire-and-forget) ────────
     if (

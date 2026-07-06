@@ -126,6 +126,17 @@ export async function POST(
   }
 
   const { email, role, password } = parsed.data;
+
+  // Only an admin may grant the admin role. This route runs with the service
+  // role (bypassing the RLS that reserved membership writes to admins), so the
+  // manager->admin escalation must be blocked here.
+  if (role === "admin" && auth.role !== "admin") {
+    return NextResponse.json(
+      { error: "Solo un admin puede asignar el rol admin" },
+      { status: 403 },
+    );
+  }
+
   const db = svc();
 
   // Provision the account directly — no invite email / SMTP. The agency shares
@@ -199,6 +210,31 @@ export async function PATCH(
   const { userId, role, is_active } = parsed.data;
   const db = svc();
 
+  // Admin-only guardrails (this route bypasses the admins-only RLS on
+  // memberships). A manager must not be able to promote anyone to admin, nor
+  // modify an existing admin's membership (which would let them demote,
+  // deactivate, or self-escalate around it).
+  if (auth.role !== "admin") {
+    if (role === "admin") {
+      return NextResponse.json(
+        { error: "Solo un admin puede asignar el rol admin" },
+        { status: 403 },
+      );
+    }
+    const { data: target } = await db
+      .from("memberships")
+      .select("role")
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (target?.role === "admin") {
+      return NextResponse.json(
+        { error: "Solo un admin puede modificar a otro admin" },
+        { status: 403 },
+      );
+    }
+  }
+
   const updates: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
@@ -246,6 +282,22 @@ export async function DELETE(
 
   const { userId } = parsed.data;
   const db = svc();
+
+  // A manager must not be able to deactivate an admin (bypasses admins-only RLS).
+  if (auth.role !== "admin") {
+    const { data: target } = await db
+      .from("memberships")
+      .select("role")
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (target?.role === "admin") {
+      return NextResponse.json(
+        { error: "Solo un admin puede desactivar a otro admin" },
+        { status: 403 },
+      );
+    }
+  }
 
   const { error } = await db
     .from("memberships")

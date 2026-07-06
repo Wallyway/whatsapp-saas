@@ -4,9 +4,17 @@
  * Both production (buffer.ts) and the in-UI playground (test-chat) MUST use this
  * so they never drift. Pure string assembly — no DB, no "use server".
  *
- * Order (guardrails go LAST — models obey end-of-prompt instructions most):
- *   now → summary → business info → knowledge base → response style →
- *   prompt base → WhatsApp format note → strict rules/restrictions
+ * Order is optimized for prompt caching: STABLE content first (identical across
+ * turns for a workspace/agent, so it forms a long cacheable prefix), VOLATILE
+ * content last (changes every turn/minute, so it can never be cached anyway):
+ *   [stable]   prompt base → business info → response style → WhatsApp format
+ *              → media note → strict rules/restrictions
+ *   [volatile] current date/time → conversation summary → knowledge base
+ *
+ * Putting the per-minute clock, rolling summary and per-query KB first (as it
+ * used to) changed the prefix every single turn and defeated caching entirely.
+ * The guardrails stay as the last *instructions*; only retrieved context data
+ * follows them.
  */
 
 export type ResponseStyle = "concise" | "balanced" | "detailed";
@@ -104,15 +112,17 @@ export function buildSystemPrompt(parts: BuildSystemPromptParts): string {
   const guardrailsBlock = buildGuardrailsBlock(parts.guardrails);
 
   return [
-    parts.nowContext,
-    summaryBlock,
-    parts.bizContext,
-    parts.kbContext ?? "",
-    styleBlock,
+    // ── Stable prefix (cacheable) ──
     base,
+    parts.bizContext,
+    styleBlock,
     WHATSAPP_FORMAT_NOTE,
     MEDIA_CAPABILITY_NOTE,
     guardrailsBlock,
+    // ── Volatile suffix (changes per turn) ──
+    parts.nowContext,
+    summaryBlock,
+    parts.kbContext ?? "",
   ]
     .filter(Boolean)
     .join("\n\n");
