@@ -1,33 +1,34 @@
 // F1-E1: Human agent sends a free-text message from the inbox composer.
 
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { dispatchText } from "@/features/inbox/services/dispatch";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
-import { readJsonBody } from "@/lib/auth/workspace-access";
+import {
+  readJsonBody,
+  requireWorkspaceMember,
+} from "@/lib/auth/workspace-access";
 
 const BodySchema = z.object({
   body: z.string().min(1).max(4096),
 });
 
+function svc() {
+  return createSbClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+}
+
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  // 1. Auth
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   const { id: conversationId } = await params;
 
-  // 2. Validate request body
+  // 1. Validate request body
   const parsed_body = await readJsonBody(req);
   if (!parsed_body.ok) return parsed_body.response;
   const parsed = BodySchema.safeParse(parsed_body.body);
@@ -35,8 +36,12 @@ export async function POST(
     return NextResponse.json({ error: "Invalid body" }, { status: 400 });
   }
 
-  // 3. Load conversation to get workspace_id
-  const { data: conv } = await supabase
+  // 2. Resolve the conversation's workspace (service-role: we authorize below).
+  //    Without this the route only checked "is logged in" — any authenticated
+  //    user could send a real WhatsApp to any conversation in any workspace
+  //    (cross-tenant IDOR), and a viewer could send at all.
+  const admin = svc();
+  const { data: conv } = await admin
     .from("conversations")
     .select("workspace_id, window_expires_at, ai_enabled")
     .eq("id", conversationId)
@@ -45,6 +50,14 @@ export async function POST(
   if (!conv) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
+
+  // 3. Require an active member of THAT workspace with at least the agent role
+  //    (viewers are read-only and must not send outbound messages).
+  const auth = await requireWorkspaceMember(conv.workspace_id, {
+    minRole: "agent",
+  });
+  if (!auth.ok) return auth.response;
+  const user = { id: auth.userId };
 
   // 4. Dispatch via the single exit point
   const result = await dispatchText({
