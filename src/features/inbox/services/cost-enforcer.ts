@@ -43,12 +43,15 @@ export async function enforceCostPolicy(
   const dayStart = new Date();
   dayStart.setUTCHours(0, 0, 0, 0);
 
-  const { data: dailyEvents, error } = await supabase
-    .from("events")
-    .select("payload")
-    .eq("type", "llm_usage")
-    .eq("workspace_id", workspaceId)
-    .gte("created_at", dayStart.toISOString());
+  // Aggregate in SQL — a raw SELECT is capped at ~1000 rows by PostgREST and
+  // would undercount past that, letting the budget be blown at high volume.
+  const { data: sumTokens, error } = await supabase.rpc(
+    "sum_llm_tokens_since",
+    {
+      p_workspace_id: workspaceId,
+      p_since: dayStart.toISOString(),
+    },
+  );
 
   if (error) {
     console.error("[cost-enforcer] failed to read daily events:", error);
@@ -56,11 +59,7 @@ export async function enforceCostPolicy(
     return { policy: "allow", reason: "db_error_fail_open" };
   }
 
-  const totalTokensToday = (dailyEvents ?? []).reduce((sum, row) => {
-    const payload = row.payload as Record<string, unknown> | null;
-    const t = payload?.total_tokens;
-    return sum + (typeof t === "number" ? t : 0);
-  }, 0);
+  const totalTokensToday = Number(sumTokens ?? 0);
 
   if (totalTokensToday >= DAILY_TOKEN_HARD_LIMIT) {
     console.warn(

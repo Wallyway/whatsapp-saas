@@ -73,15 +73,18 @@ export async function checkRateLimits(
   const nowMs = performance.timeOrigin + performance.now();
 
   // ── 1. Per-contact hourly turn limit ──────────────────────────────────────
+  // Aggregate in SQL: a raw SELECT is capped at ~1000 rows by PostgREST and
+  // would undercount past that, defeating the limit at high volume.
   const hourAgo = new Date(nowMs - 3_600_000).toISOString();
 
-  const { data: hourlyEvents, error: hourlyError } = await supabase
-    .from("events")
-    .select("id")
-    .eq("type", "llm_usage")
-    .eq("workspace_id", workspaceId)
-    .filter("payload->>contact_id", "eq", contactId)
-    .gte("created_at", hourAgo);
+  const { data: hourlyCount, error: hourlyError } = await supabase.rpc(
+    "count_llm_turns_for_contact_since",
+    {
+      p_workspace_id: workspaceId,
+      p_contact_id: contactId,
+      p_since: hourAgo,
+    },
+  );
 
   if (hourlyError) {
     console.error("[cost-tracker] hourly check error:", hourlyError);
@@ -89,7 +92,7 @@ export async function checkRateLimits(
     return { allowed: true };
   }
 
-  if ((hourlyEvents?.length ?? 0) >= LLM_TURNS_PER_CONTACT_PER_HOUR) {
+  if (Number(hourlyCount ?? 0) >= LLM_TURNS_PER_CONTACT_PER_HOUR) {
     return { allowed: false, reason: "rate_limit_contact_hour" };
   }
 
@@ -97,25 +100,20 @@ export async function checkRateLimits(
   const dayStart = new Date(nowMs);
   dayStart.setUTCHours(0, 0, 0, 0);
 
-  const { data: dailyEvents, error: dailyError } = await supabase
-    .from("events")
-    .select("payload")
-    .eq("type", "llm_usage")
-    .eq("workspace_id", workspaceId)
-    .gte("created_at", dayStart.toISOString());
+  const { data: totalTokensToday, error: dailyError } = await supabase.rpc(
+    "sum_llm_tokens_since",
+    {
+      p_workspace_id: workspaceId,
+      p_since: dayStart.toISOString(),
+    },
+  );
 
   if (dailyError) {
     console.error("[cost-tracker] daily check error:", dailyError);
     return { allowed: true };
   }
 
-  const totalTokensToday = (dailyEvents ?? []).reduce((sum, row) => {
-    const payload = row.payload as Record<string, unknown> | null;
-    const t = payload?.total_tokens;
-    return sum + (typeof t === "number" ? t : 0);
-  }, 0);
-
-  if (totalTokensToday >= LLM_DAILY_BUDGET_TOKENS) {
+  if (Number(totalTokensToday ?? 0) >= LLM_DAILY_BUDGET_TOKENS) {
     return { allowed: false, reason: "daily_token_budget_exceeded" };
   }
 
